@@ -6,7 +6,7 @@
 - Created date
   - 2026-07-13
 - Updated date
-  - 2026-07-30
+  - 2026-08-12
 - Issue
   - [#1457](https://github.com/ballerina-platform/ballerina-spec/issues/1457)
 - State
@@ -59,7 +59,7 @@ Microsoft's SDK is structured as a chain of four clients (`ShareServiceClient` a
 
 The lower SDK levels are not surfaced as classes. Directory and file operations are methods on `Client` taking a single slash-delimited, share-relative `path` (for example `"/reports/2026/q4.pdf"`); the Java adaptor splits the path into the segments the SDK requires. Where two paths co-occur they are named `sourcePath` and `destinationPath` in logical source-first order.
 
-`AdminClient`, `Client`, and `Caller` are isolated client classes holding only immutable configuration, and the `Listener` is an isolated class, so a single instance of any of them can be used safely from concurrent strands. Every operation that calls the service is a `remote` method, invoked with `->`. Methods that make no service call are ordinary methods, invoked with `.`: each client's `close`, the `Caller`'s `getShareName`, the `Listener`'s lifecycle methods, and the SAS generation methods, which sign tokens locally with the credential the client already holds. The `isolated` qualifier is omitted from the signatures below for brevity.
+`AdminClient`, `Client`, and `Caller` are isolated client classes holding only immutable configuration, and the `Listener` is an isolated class, so a single instance of any of them can be used safely from concurrent strands. Every operation that calls the service is a `remote` method, invoked with `->`. Methods that make no service call are ordinary methods, invoked with `.`: the `Listener`'s lifecycle methods and the SAS generation methods, which sign tokens locally with the credential the client already holds. The clients hold no releasable resources, so there is no close method; a client that is no longer needed is simply discarded. The `isolated` qualifier is omitted from the signatures below for brevity.
 
 Because `azure-storage-blob` and `azure-storage-file-share` depend on the same `azure-storage-common` artifact, splitting Blob and Files into two Ballerina packages duplicates nothing at the JVM level: the auth, signing, and retry layer is shared by Microsoft's own packaging.
 
@@ -138,7 +138,7 @@ public type EntraIdConfig DefaultEntraIdConfig|ManagedIdentityConfig|ClientSecre
     ClientCertificateConfig|WorkloadIdentityConfig;
 ```
 
-Azure Files honors OAuth tokens only on requests carrying the backup intent, which the connector sets automatically. The intent bypasses file and directory ACLs and requires the identity to hold the `Storage File Data Privileged Reader` or `Storage File Data Privileged Contributor` role.
+Azure Files honors OAuth tokens only on requests carrying the backup intent, which the connector sets automatically. The intent bypasses file and directory ACLs and requires the identity to hold the `Storage File Data Privileged Reader` or `Storage File Data Privileged Contributor` role. Those roles cover the file and directory data operations; share-level and account-level management operations (the `AdminClient` surface, and the `Client` operations on the share itself) authorize against the storage account's management role actions instead (`Microsoft.Storage/storageAccounts/fileServices/shares/` read, write, and delete, carried by roles such as `Contributor`), so an identity covering the full surface holds both a privileged data role and a management role.
 
 ```ballerina
 # The credential-kind discriminator value selecting `DefaultEntraIdConfig`.
@@ -306,20 +306,12 @@ remote function getUserDelegationKey(time:Utc startTime, time:Utc expiryTime) re
 # string carrying an account key); rotating the account key revokes every
 # SAS minted from it.
 function generateAccountSas(AccountSasSignatureValues values) returns string|Error;
-
-# Ordinary method: releases connector-owned resources, no service call.
-# Subsequent operations on a closed client fail.
-public function close() returns Error?;
 ```
 
 ### 4. The `Client`
 
 ```ballerina
 public function init(string shareName, *ClientConfiguration config) returns Error?;
-
-# Ordinary method: releases connector-owned resources, no service call.
-# Subsequent operations on a closed client fail.
-public function close() returns Error?;
 ```
 
 Binding is lazy: `init` makes no call to Azure, so the first operation against a nonexistent share fails with `NotFoundError`; the up-front check is `AdminClient.hasShare`.
@@ -388,22 +380,40 @@ remote function renameFile(string sourcePath, string destinationPath, RenameOpti
 #### 4.4 Transfer operations
 
 ```ballerina
-# uploadFile/downloadFile move a local file on disk; both paths are full paths
-# including the file name. uploadContent takes in-memory content (byte[]/string
-# written as-is, xml serialized, map<json> serialized as JSON). uploadFromStream
-# requires contentLength because Azure Files pre-allocates a file at a fixed
-# size before content is written into its ranges; a source-stream failure, or a
-# stream whose length does not match contentLength, surfaces as a
-# ProcessingError. The transfer methods chunk internally, and getFileContent
-# reads lazily, so memory stays bounded for any file size. downloadFile fails
-# with a ProcessingError when a local file already exists at destinationPath.
-# DownloadOptions offers a byte range and a snapshotId to read from a share
-# snapshot.
+# uploadFile copies a local file to the share and downloadFile copies a share
+# file to a local path; neither deletes its source. Both take full paths
+# including the file name, in source-first order. uploadContent takes in-memory
+# content (byte[]/string written as-is, xml in its textual form, map<json> as a
+# JSON document, string[][] as CSV rows in the dialect getFileCsv reads back).
+# uploadFromStream requires contentLength because Azure Files pre-allocates a
+# file at a fixed size before content is written into its ranges; a
+# source-stream failure, or a stream whose length does not match contentLength,
+# surfaces as a client-side Error, and the pre-allocated file, holding whatever
+# ranges were written before the failure, stays at the destination for the
+# caller to inspect, overwrite, or delete. The transfer methods chunk
+# internally (small source chunks coalesce into range writes of the service's
+# maximum range size), and getFileContent reads lazily, so memory stays bounded
+# for any file size. downloadFile fails with a client-side Error when a local
+# file already exists at destinationPath. DownloadOptions offers a byte range
+# and a snapshotId to read from a share snapshot.
 remote function uploadFile(string sourcePath, string destinationPath, UploadOptions? options = ()) returns Error?;
-remote function uploadContent(byte[]|string|xml|map<json> content, string destinationPath, UploadOptions? options = ()) returns Error?;
+remote function uploadContent(byte[]|string|xml|map<json>|string[][] content, string destinationPath, UploadOptions? options = ()) returns Error?;
 remote function uploadFromStream(stream<byte[], error?> content, int contentLength, string destinationPath, UploadOptions? options = ()) returns Error?;
 remote function downloadFile(string sourcePath, string destinationPath, DownloadOptions? options = ()) returns Error?;
 remote function getFileContent(string path, DownloadOptions? options = ()) returns stream<byte[], Error?>|Error;
+
+# The typed reads materialize the file's full content and bind it to the
+# caller-directed target type: getFileText decodes UTF-8 text, getFileJson
+# binds a JSON document to a json form or a record, getFileXml binds to an xml
+# value or a record projected from the document, and getFileCsv binds to
+# string[][] rows or to a record array whose field names come from the file's
+# header row (the string-matrix form keeps every row, including the first).
+# Binding is strict: content that does not match the target type fails with a
+# client-side Error.
+remote function getFileText(string path, DownloadOptions? options = ()) returns string|Error;
+remote function getFileJson(string path, DownloadOptions? options = (), typedesc<json|record {}> targetType = <>) returns targetType|Error;
+remote function getFileXml(string path, DownloadOptions? options = (), typedesc<xml|record {}> targetType = <>) returns targetType|Error;
+remote function getFileCsv(string path, DownloadOptions? options = (), typedesc<string[][]|record {}[]> targetType = <>) returns targetType|Error;
 ```
 
 #### 4.5 Copy operations
@@ -441,9 +451,10 @@ remote function listRanges(string path, RangeListOptions? options = ()) returns 
 A share snapshot is a point-in-time, read-only copy of the whole share. Snapshot contents are read through the regular read operations: pass the returned `snapshotId` in `DownloadOptions` (`downloadFile`, `getFileContent`) or `ListOptions` (`list`) to resolve the same paths inside the snapshot instead of the live share.
 
 ```ballerina
-# listShareSnapshots and deleteShareSnapshot run service-level operations, so
-# they need account-level credentials (an account key, a connection string
-# carrying one, or an account SAS; a share-scoped SAS is not sufficient).
+# The snapshot operations are account-scoped: createShareSnapshot,
+# listShareSnapshots, and deleteShareSnapshot all need account-level
+# credentials (an account key, a connection string carrying one, or an
+# account SAS; a share-scoped SAS is not sufficient).
 remote function createShareSnapshot(map<string>? metadata = ()) returns ShareSnapshotInfo|Error;
 remote function listShareSnapshots() returns ShareSnapshotInfo[]|Error;
 remote function deleteShareSnapshot(string snapshotId) returns Error?;
@@ -490,8 +501,8 @@ These update properties after creation; only what is set is changed, and every o
 
 ```ballerina
 # Changes the share's quota or access tier; administrative, needs
-# account-key-level credentials, and fails with an AuthorizationError on SAS
-# credentials.
+# account-level credentials, and fails with an AuthorizationError on a
+# share-scoped SAS.
 remote function setShareProperties(ShareSetPropertiesOptions options) returns Error?;
 # Covers content headers, SMB properties, an SDDL permission, a new file size
 # (growing pre-allocates, shrinking truncates), and POSIX attributes.
@@ -530,7 +541,7 @@ function generateShareUserDelegationSas(ShareSasSignatureValues values, UserDele
 function generateUserDelegationSas(string path, FileSasSignatureValues values, UserDelegationKey key) returns string|Error;
 ```
 
-`generateShareSas` and `generateSas` sign with the account key, so the client must be authenticated with `SharedKeyConfig` (or a connection string carrying an account key); rotating the account key revokes every SAS minted from it. The signature values carry the validity window, the permissions, and optionally a protocol restriction, an IP range, or a stored access policy `identifier` in place of an explicit window and permissions. The user-delegation variants sign with a `UserDelegationKey` (from `AdminClient.getUserDelegationKey`) instead of the account key, so no storage key is ever handled; they are valid at most 7 days (the key's lifetime), and stored access policies do not apply to them.
+`generateShareSas` and `generateSas` sign with the account key, so the client must be authenticated with `SharedKeyConfig` (or a connection string carrying an account key); rotating the account key revokes every SAS minted from it. The signature values carry the validity window, the permissions, and optionally a protocol restriction, an IP range, or a stored access policy `identifier` in place of an explicit expiry and permissions; generation fails with an `Error` when neither the identifier nor both `expiryTime` and `permissions` are supplied. The user-delegation variants sign with a `UserDelegationKey` (from `AdminClient.getUserDelegationKey`) instead of the account key, so no storage key is ever handled; they are valid at most 7 days (the key's lifetime), and stored access policies do not apply to them: the user-delegation variants reject an `identifier` and require an explicit `expiryTime` and `permissions`.
 
 #### 4.14 NFS link operations
 
@@ -544,26 +555,41 @@ remote function getSymbolicLink(string path) returns string|Error;
 
 ### 5. The `Listener` and `Caller`
 
-Azure Files is not exposed as an Event Grid source, so the listener polls, following the model of `ballerina/ftp`. It uses **stateless dispatch**: each polling tick lists the watched path and reads each present file, invoking the content handler that matches it. No per-file state is kept, so the contract is that handlers consume files by processing them and then deleting or moving them out of the watched path; an unprocessed file fires again on a later poll. This mode is trivially restart-safe. Delivery is at-least-once. Polling runs on the platform task scheduler at a fixed `pollingInterval`, with the scheduler's waiting policy pinned so a tick that fires during a still-running scan waits for it; dispatched handlers run concurrently beyond the scan. An in-progress guard keyed on the file's path and entity tag keeps one version of a file from being dispatched twice at once, so an unchanged file re-fires only after its previous handling has finished and it is still present; a file overwritten while its previous version is still being handled counts as a new version and can be dispatched alongside it. Handlers should be idempotent, or claim a file by renaming it out of the watched path before processing.
+Azure Files is not exposed as an Event Grid source, so the listener polls, following the model of `ballerina/ftp`. It uses **stateless dispatch**: each polling tick lists the watched path and reads each present file, invoking the content handler that matches it. No per-file state is kept, so the contract is that handlers consume files by processing them and then deleting or moving them out of the watched path; an unprocessed file fires again on a later poll. This mode is trivially restart-safe. Delivery is at-least-once.
 
-One listener watches exactly one service and one path. The listener configuration carries the share-level concerns (credentials, polling cadence, transport). What to watch is declared on the service through the `@ServiceConfig` annotation: its required `path` field is the share-relative path the service watches (write `path: "/"` for the share root), and the annotation's remaining fields configure recursion and file-name filtering.
+Polling runs on the platform task scheduler at a fixed `pollingInterval`, whose waiting policy makes a tick that fires during a still-running scan wait for it; each matching file is dispatched to its handler on its own thread, so handlers run concurrently beyond the scan. An in-progress guard keyed on the file's path ensures one file is never dispatched to two invocations at once, so a file re-fires only after its previous handling has finished and it is still present; a file overwritten while its previous version is still being handled is dispatched with its new content on a later poll, once that handling completes. To keep that promise under auto-consume, a configured `afterProcess` or `afterError` action first checks that the file's entity tag still matches the dispatched version and leaves a changed file for the next poll; the instant between that check and the action stays unguarded, since Azure Files offers no conditional deletes or renames. A file overwritten in the short window between a poll's listing and its content read is delivered with the new content while the accompanying `FileInfo` still describes the listed version; Azure Files offers no conditional reads to close that window. Handlers should be idempotent, or claim a file by renaming it out of the watched path before processing.
+
+One listener watches exactly one service and one path. The listener configuration carries the share-level concerns (credentials, polling cadence, transport, content-binding behaviour). What to watch is the service's attach point: `service /invoices on lsn` (a resource path, whose segments join with `/`) or `service "/dir one/reports" on lsn` (a string, for names a resource path cannot express). The path normalizes by trimming whitespace, collapsing repeated slashes, ensuring a leading slash, and stripping a trailing one; a service with no attach point watches the share root. The optional `@ServiceConfig` annotation configures recursion and file-name filtering; no annotation is needed for a service to work.
 
 ```ballerina
 public type ListenerConfiguration record {|
     # The authentication configuration
     AuthConfig auth;
-    # Polling interval in seconds
+    # Polling interval in seconds; must be greater than zero
     decimal pollingInterval = 60;
     # Retry configuration for the underlying client
     RetryConfig retryConfig?;
     # HTTP transport configuration for the underlying client
     TransportConfig transportConfig?;
+    # Relaxed data binding for the typed content handlers
+    boolean laxDataBinding = false;
+    # Fail-safe CSV processing; skipped records go to an error log file
+    FailSafeOptions csvFailSafe?;
 |};
 
+public type FailSafeOptions record {|
+    # What each skipped CSV record's error log entry carries
+    ErrorLogContentType contentType = METADATA;
+|};
+
+public enum ErrorLogContentType {
+    METADATA,
+    RAW,
+    RAW_AND_METADATA
+}
+
 public type ServiceConfiguration record {|
-    # Share-relative path this service watches (required; "/" is the share root)
-    string path;
-    # Whether the service watches subdirectories under its path
+    # Whether the service watches subdirectories under the watched path
     boolean recursive = true;
     # Regex on the file name; non-matching files are never dispatched to this service
     string fileNamePattern?;
@@ -574,7 +600,9 @@ public type ServiceConfiguration record {|
 public annotation ServiceConfiguration ServiceConfig on service;
 ```
 
-A listener already bound to a service rejects a second `attach` at runtime, so to watch several paths, run several independent listeners. Overlap can still arise across separate listeners (a file under a path watched by two of them reaches each), so handling races there are the user's responsibility (idempotent handlers, or claim a file by renaming it out of the watched path). Attaching a service with no `path`, or an invalid `fileNamePattern`, fails. Calling `start` on a listener that is already running fails, and `detach` of a service that is not attached fails.
+A listener already bound to a service rejects a second `attach` at runtime, so to watch several paths, run several independent listeners. Overlap can still arise across separate listeners (a file under a path watched by two of them reaches each), so handling races there are the user's responsibility (idempotent handlers, or claim a file by renaming it out of the watched path).
+
+The `attach` `name` argument carries the service's attach point, which is the watched path. Attaching a service with an invalid `fileNamePattern` fails; a credential that cannot list the watched path does not fail `attach`, the first poll surfaces the authorization error instead. Calling `start` on a listener that is already running fails, and `detach` of a service that is not attached fails. `gracefulStop` and `immediateStop` both stop the polling schedule; in either case, handler invocations already running complete on their own threads.
 
 ```ballerina
 public isolated class Listener {
@@ -592,6 +620,8 @@ public type Service distinct service object {
 
 # Carries what a directory listing provides, the Listener's data source.
 public type FileInfo record {|
+    # The name of the share the file lives on
+    string shareName;
     # Share-relative path, e.g. "/dir1/dir2/file.ext"
     string path;
     # File name only
@@ -605,7 +635,21 @@ public type FileInfo record {|
 |};
 ```
 
-A service declares at least one content handler. `onFile(byte[] content, FileInfo file, Caller caller)` is the optional raw-bytes catch-all, and the typed variants `onFileText` (string), `onFileJson` (a `map<json>`, a record, a `map<json>[]`, or a record array), `onFileXml` (xml), and `onFileCsv` (string[][]) receive a matching file's content already deserialised. An object root binds the `onFileJson` map and record forms (a record binds by projection), and an array root binds the array forms element by element. A scalar root, or a root that does not match the declared form, is a content-binding error. The `FileInfo` and `Caller` parameters are optional trailing parameters: a handler declares its content parameter first, then either, both, or neither of `FileInfo` and `Caller` (with `FileInfo` before `Caller` when both are present), so the accepted shapes are `(content)`, `(content, FileInfo)`, `(content, Caller)`, and `(content, FileInfo, Caller)`, and the listener passes only what the handler declares. Routing is by file extension (`txt` to `onFileText`, `json` to `onFileJson`, `xml` to `onFileXml`, `csv` to `onFileCsv`), and a per-handler `@FunctionConfig` pattern overrides it. A file routed to a typed variant whose content is malformed raises a content-binding error rather than falling through to `onFile`. A compiler plugin validates the service at compile time: at least one content handler, each handler's parameter types and `error?` return (including the accepted parameter shapes), no resource functions or unknown remote methods, and the presence of `@ServiceConfig` (whose required `path` field the type checker then enforces).
+A service declares at least one content handler. `onFile` is the raw-bytes catch-all, taking its content as `byte[]` or as `stream<byte[], error?>`, and the typed variants receive a matching file's content already deserialised: `onFileText` takes a `string`, `onFileJson` takes a `map<json>`, a record, a `map<json>[]`, or a record array, `onFileXml` takes an `xml` document or a record, and `onFileCsv` takes a `string[][]`, a record array, a `stream<string[], error?>`, or a `stream<record {}, error?>`.
+
+An object root binds the `onFileJson` map and record forms (a record binds by projection), and an array root binds the array forms element by element. The `string[][]` and `stream<string[]>` CSV forms yield every row of the file; the CSV record forms map each row's fields through the file's first row, the header. An XML record target binds the document's elements to the record's fields. A root that does not match the declared form is a content-binding error.
+
+The `FileInfo` and `Caller` parameters are optional trailing parameters: a handler declares its content parameter first, then either, both, or neither of `FileInfo` and `Caller` (with `FileInfo` before `Caller` when both are present), so the accepted shapes are `(content)`, `(content, FileInfo)`, `(content, Caller)`, and `(content, FileInfo, Caller)`, and the listener passes only what the handler declares.
+
+Routing is by file extension (`txt` to `onFileText`, `json` to `onFileJson`, `xml` to `onFileXml`, `csv` to `onFileCsv`), and a per-handler `@FunctionConfig` pattern overrides it. When more than one routing pattern matches a file name, the winner is fixed: patterns are checked in the order `onFileText`, `onFileJson`, `onFileXml`, `onFileCsv`, then `onFile`, so a typed handler's pattern always beats the catch-all's. A file routed to a typed variant whose content is malformed raises a content-binding error rather than falling through to `onFile`.
+
+Binding is strict by default; setting `laxDataBinding` on the listener relaxes it, so JSON and CSV record binding treat a null value as an optional field and an absent member as a nilable field, and XML record binding tolerates elements the record does not declare. With `csvFailSafe` set, a malformed record in a materialized CSV binding is skipped instead of failing the whole binding, and is appended to an error log file named `<sourceBaseName>_error.log` in the process working directory; the `contentType` field selects what each entry carries. Fail-safe mode applies to the materialized CSV forms only, not the stream forms.
+
+The stream content forms read the file from the service in chunks as the handler drains the stream, instead of downloading it up front. A stream closes its underlying source at the end of the file, and a handler that abandons a stream early should call its `close()`. A CSV stream row that fails to bind surfaces as the error entry of that `next()` call, after which the stream is closed. The consume actions run on the handler's return exactly as for materialized content, so a handler that deletes or moves the file (or declares `afterProcess`) while its stream is not fully drained loses access to the remaining content.
+
+A service may also declare an `onError` handler, `remote function onError(Error err, Caller caller?) returns error?` (the first parameter may equally be typed as the bare `error`, and the `Caller` parameter is optional), which is notified when a poll fails (with the mapped typed error, for example an `AuthorizationError` when the credential lacks access) and when a typed handler's content binding fails (with a client-side `Error`). It is not a content handler: it does not satisfy the at-least-one-handler requirement, takes no annotation, and does not change what happens to the file, so a declared `afterError` still applies to a binding failure. An error returned by `onError` itself is swallowed. Errors returned by content handlers do not notify `onError`, and neither does a CSV stream row that fails to bind lazily (that error belongs to the handler draining the stream).
+
+A compiler plugin validates the service at compile time: at least one content handler, each handler's parameter types and `error?` return (including the accepted parameter shapes and the `onError` signature), and no resource functions or unknown remote methods.
 
 A handler can consume a file by declaring `@FunctionConfig`, which moves or deletes the file after the handler runs:
 
@@ -619,65 +663,59 @@ public type Move record {|
     boolean preserveSubDirs = true;
 |};
 
+public type MOVE Move;
+
 public type FunctionConfiguration record {|
     # Per-handler routing override (regex on the file name)
     string fileNamePattern?;
     # Auto-consume after the handler succeeds
-    DELETE|Move afterProcess?;
+    DELETE|MOVE afterProcess?;
     # Auto-consume after the handler errors or content-binding fails
-    DELETE|Move afterError?;
+    DELETE|MOVE afterError?;
 |};
 
 public annotation FunctionConfiguration FunctionConfig on object function;
 ```
 
-`afterProcess` runs when the handler returns normally, and `afterError` when it errors or content-binding fails; when neither is set the file stays and re-fires. A `Move` onto an existing same-named file fails.
+`afterProcess` runs when the handler returns normally, and `afterError` when it errors or content-binding fails; when neither is set the file stays and re-fires. A `Move` onto an existing same-named file replaces it, so a recurring file name moves cleanly every time; with `preserveSubDirs: false`, same-named files from different subdirectories land on one destination name and the last move wins, so flattened moves should only be used where names are unique.
 
-A `Caller` is passed to each handler so it can act on the event's file without constructing a separate client. It forwards a curated share-scoped subset of `Client` (`downloadFile`, `getFileContent`, `uploadFile`, `uploadContent`, `deleteFile`, `copyFile`, `checkCopyStatus`, `abortCopy`, `renameFile`, `createDirectory`, `deleteDirectory`, `list`) plus a non-remote `getShareName()`. Handlers pass the event's path explicitly, e.g. `caller->deleteFile(file.path)`.
+A `Caller` is passed to each handler so it can act on the event's file without constructing a separate client. The listener's own polling uses the same share-scoped client that backs the `Caller`, so one listener holds exactly one connection stack. The `Caller` forwards a curated share-scoped subset of `Client` (`downloadFile`, `getFileContent`, `getFileText`, `getFileJson`, `getFileXml`, `getFileCsv`, `uploadFile`, `uploadContent`, `deleteFile`, `copyFile`, `checkCopyStatus`, `abortCopy`, `renameFile`, `createDirectory`, `deleteDirectory`, `list`). Handlers pass the event's path explicitly, e.g. `caller->deleteFile(file.path)`, and read the share's name from `FileInfo.shareName`.
 
-A poll failure applies exponential backoff to the polling interval, capped at five minutes.
+A failed poll surfaces its error: the listener logs it on every poll, and a declared `onError` receives it. Polling keeps its configured interval, so the next scheduled poll scans again.
 
 ### 6. Errors
 
-A distinct error hierarchy allows pattern-matching on specific failures:
+Every error raised by an operation of the module is a subtype of the distinct `Error` type. The hierarchy splits by origin: an error the Azure service raised is a `ServiceError` and carries a `ServiceErrorDetail` with the HTTP status and the Azure error code of the failed request, while a client-side failure is the generic `Error` and carries no detail (no server exchange produced a status or a code, and the connector never fabricates them). Callers can pattern-match on specific failures:
 
 ```ballerina
-public type ErrorDetail record {|
-    # The HTTP status code returned by Azure. Absent when the failure happened
-    # without a server exchange (e.g. a ProcessingError raised client-side)
-    int httpStatus?;
-    # The Azure error code (e.g. `ShareNotFound`), or a connector-defined
-    # identifier for client-side failures
+public type ServiceErrorDetail record {|
+    # The HTTP status code returned by Azure
+    int httpStatus;
+    # The Azure error code (e.g. `ShareNotFound`)
     string errorCode;
 |};
 
-public type Error                    distinct error<ErrorDetail>;
-public type NotFoundError            distinct Error;
-public type ConflictError            distinct Error;
-public type AuthorizationError       distinct Error;
-public type PreconditionFailedError  distinct Error;
-public type RangeNotSatisfiableError distinct Error;
-public type QuotaExceededError       distinct Error;
-public type ProcessingError          distinct Error;
+public type Error                    distinct error;
+public type ServiceError             distinct (Error & error<ServiceErrorDetail>);
+public type NotFoundError            distinct ServiceError;
+public type ConflictError            distinct ServiceError;
+public type AuthorizationError       distinct ServiceError;
+public type PreconditionFailedError  distinct ServiceError;
+public type RangeNotSatisfiableError distinct ServiceError;
+public type QuotaExceededError       distinct ServiceError;
 ```
 
+* `ServiceError`: any error raised by the Azure service; a service failure whose Azure error code maps to none of the specific subtypes below stays this generic type.
 * `NotFoundError`: the requested share, directory, or file was not found (HTTP 404).
 * `ConflictError`: the operation conflicts with the current state of the resource, for example creating a share that already exists (HTTP 409).
 * `AuthorizationError`: authentication or authorization failed, for example an invalid key or insufficient SAS permissions (HTTP 403).
 * `PreconditionFailedError`: a precondition such as an ETag condition or a lease-id requirement was not met (HTTP 412).
 * `RangeNotSatisfiableError`: the requested byte range cannot be satisfied for the target file (HTTP 416).
 * `QuotaExceededError`: a write was rejected because the share's provisioned capacity is exhausted (HTTP 403).
-* `ProcessingError`: a client-side failure while preparing the request or decoding the response, with no server round-trip.
 
 Mapping keys on the Azure error code string, not the HTTP status alone: `ShareSizeLimitReached` (403) maps to `QuotaExceededError`, distinct from auth failures (also 403) mapping to `AuthorizationError`. The human-readable message becomes the Ballerina error's `message()` rather than being duplicated into the detail record.
 
-### 7. Listener advanced surface (additive)
-
-The Listener design accounts for additional capabilities; the following arrive as additive handlers, filters, and configuration on the same class, kept out of the core surface so the common path stays small:
-
-* **`Listener`:** a snapshot-diff mode that compares each poll against an in-memory `path` to etag snapshot and fires `onFileAdd`, `onFileDelete`, and `onFileModify` once per change; a generic `onFileChange` batch handler; an `onError` hook; and a `maxBatchSize` filter.
-
-### 8. Usage
+### 7. Usage
 
 Working with files in a share:
 
@@ -697,8 +735,6 @@ public function main() returns error? {
     });
 
     check fileShare->downloadFile("/2026/07/invoice.pdf", "./copies/invoice.pdf");
-
-    check fileShare.close();
 }
 ```
 
@@ -712,10 +748,7 @@ listener files:Listener invoiceListener = check new ("invoices",
     pollingInterval = 30
 );
 
-@files:ServiceConfig {
-    path: "/incoming"
-}
-service on invoiceListener {
+service /incoming on invoiceListener {
     remote function onFile(byte[] content, files:FileInfo file, files:Caller caller) returns error? {
         check caller->downloadFile(file.path, "./processed/" + file.name);
         // Consume the file so it does not fire again on the next poll.
@@ -732,8 +765,6 @@ files:AdminClient admin = check new (auth = {accountName: "myacct", accountKey: 
 if !(check admin->hasShare("invoices")) {
     check admin->createShare("invoices", {quotaInGb: 100});
 }
-
-check admin.close();
 ```
 
 Minting a read-only, one-hour SAS token for a single file (a local signing operation, invoked with `.`):
@@ -766,13 +797,11 @@ if properties is files:NotFoundError {
 * **Generate a client from the REST/OpenAPI definition.** Rejected: the generated client would still leave Shared Key signing, SAS construction, retry, and chunked transfer to be implemented and maintained by hand; the official SDK already encapsulates all of it and tracks new API versions.
 * **Surface the SDK's four-client chain directly** (`ShareServiceClient`, `ShareClient`, `ShareDirectoryClient`, `ShareFileClient`). Rejected: navigating a client chain to reach a file is SDK ergonomics, not Ballerina ergonomics. Two clients plus a combined `path` parameter keeps the common case to a single object and small signatures.
 * **One combined package for Blob and Files.** Rejected: users pull one artifact per service everywhere else in the ecosystem, and Microsoft's own packaging already shares the common auth/retry layer between the two SDK artifacts, so separate Ballerina packages duplicate nothing.
+* **A stateful snapshot-diff listener mode** (comparing each poll against a per-poll path-to-ETag snapshot and firing `onFileAdd`, `onFileDelete`, and `onFileModify` events). Rejected: Azure Files keeps no change feed, so the connector would have to own change-tracking state it cannot keep honest (a restart re-baselines the snapshot and silently misses deletions that happened during downtime). The stateless consume contract stays restart-safe, and an application that wants diff semantics can keep the path-to-ETag snapshot itself on top of the stateless listener, choosing its own persistence.
 
 ## Testing
 
-Azure Files has no local emulator (Azurite covers Blob, Queue, and Table only), so the test strategy is two-layered:
-
-1. **Mock test group** (every PR, credential-free): the full surface tested against a localhost mock of the File REST service, wired through the `serviceUrl` override on the auth config. This includes canned error responses covering the Azure error-code to typed-error mapping.
-2. **Live test group** (gated): the same surface against a real storage account, using organization secrets; skipped on fork PRs.
+Azure Files has no local emulator (Azurite covers Blob, Queue, and Table only), so the suite is **dual-mode**: every test runs against an in-process localhost mock of the File REST service (wired through the `serviceUrl` override on the auth config) when no credentials are configured, and against a real storage account when they are, with no separate test groups. CI runs credential-free, so every PR exercises the full surface against the mock, including canned error responses covering the Azure error-code to typed-error mapping; the live mode runs the same tests with organization secrets. A small residue is single-mode for physical reasons: fault injection and SMB-handle fixtures exist only on the mock, while the Entra ID token flows and the NFS operations run only against live Azure.
 
 ## Dependencies
 
