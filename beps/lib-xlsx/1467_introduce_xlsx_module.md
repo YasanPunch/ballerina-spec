@@ -14,13 +14,13 @@
 
 ## Summary
 
-Ballerina has first-class, type-safe support for JSON, XML, CSV, and EDI, but no way to read or write Microsoft Excel files — the most common tabular exchange format in enterprise integration. This proposal introduces **`ballerina/xlsx`**, a library module for reading and writing Excel files in the XLSX (Office Open XML) format with type-safe data binding to Ballerina records. The module provides two API tiers: one-shot functions (`parseSheet` / `writeSheet` / `parseTable` / `writeTable`) for simple file-based ETL, and an object-based Workbook API (`Workbook`, `Sheet`, `Table`) for multi-sheet operations, byte-array I/O, and cell-level control. It includes first-class Excel Table (ListObject) support, target-type-driven date/time binding to `ballerina/time` types, optional row-level fail-safe parsing with error logging, `ballerina/constraint` integration, and atomic file writes. The public API is implemented over a native Java adaptor wrapping Apache POI.
+Ballerina has first-class, type-safe support for JSON, XML, CSV, and EDI, but until now no way to read or write Microsoft Excel files — the most common tabular exchange format in enterprise integration. This BEP documents the design of **`ballerina/xlsx`**, a library module for reading and writing Excel files in the XLSX (Office Open XML) format with type-safe data binding to Ballerina records, implemented in [`module-ballerina-xlsx`](https://github.com/ballerina-platform/module-ballerina-xlsx) and released on [Ballerina Central](https://central.ballerina.io/ballerina/xlsx/latest). The module provides two API tiers: one-shot functions (`parseSheet` / `writeSheet` / `parseTable` / `writeTable`) for simple file-based ETL, and an object-based Workbook API (`Workbook`, `Sheet`, `Table`) for multi-sheet operations, byte-array I/O, and cell-level control. It includes first-class Excel Table (ListObject) support, target-type-driven date/time binding to `ballerina/time` types, optional row-level fail-safe parsing with error logging, `ballerina/constraint` integration, and atomic file writes. The public API is implemented over a native Java adaptor wrapping Apache POI.
 
 ## Motivation
 
-1. **Excel is the enterprise tabular format.** B2B data exchange, finance and operations reporting, HR extracts, and ad-hoc business data routinely arrive and leave as `.xlsx` files. Every ecosystem an integration developer might compare Ballerina against treats Excel processing as table stakes: Python has openpyxl and pandas, Java has Apache POI, Go has excelize, Node has SheetJS. Ballerina — a language purpose-built for integration — has no support at all.
+1. **Excel is the enterprise tabular format.** B2B data exchange, finance and operations reporting, HR extracts, and ad-hoc business data routinely arrive and leave as `.xlsx` files. Every ecosystem an integration developer might compare Ballerina against treats Excel processing as table stakes: Python has openpyxl and pandas, Java has Apache POI, Go has excelize, Node has SheetJS. Ballerina — a language purpose-built for integration — had no support at all.
 
-2. **The current workarounds are poor.** An application that must consume an XLSX file today has three options, none good:
+2. **The workarounds are poor.** Without this module, an application that must consume an XLSX file has three options, none good:
    - **Direct Java interop against POI:** verbose per-project boilerplate, manual cell-type dispatch, no data binding, and handle lifecycle managed by hand. Every project re-solves the same problems (date cells, formula cells, blank-vs-missing, header mapping) with none of the type safety Ballerina is built around.
    - **Convert to CSV externally, then `ballerina/data.csv`:** adds an external pipeline step and loses everything CSV cannot express — multiple sheets, cell data types, date/time values, and Excel Tables.
    - **Cloud connectors** (`ballerinax/microsoft.excel` via the Graph API, `ballerinax/googleapis.sheets`): these operate on documents hosted in a cloud service. They cannot process a local file, or a byte payload that just arrived over HTTP, FTP, or an email attachment — the dominant shapes in which Excel data actually reaches an integration.
@@ -268,6 +268,7 @@ The module repository carries the test suite: a binding matrix across every `Cel
 
 ## References
 
+* [`ballerina/xlsx` on Ballerina Central](https://central.ballerina.io/ballerina/xlsx/latest)
 * [Ballerina XLSX Module Specification](https://github.com/ballerina-platform/module-ballerina-xlsx/blob/main/docs/spec/spec.md)
 * [Module repository: `ballerina-platform/module-ballerina-xlsx`](https://github.com/ballerina-platform/module-ballerina-xlsx)
 * [ECMA-376: Office Open XML file formats](https://ecma-international.org/publications-and-standards/standards/ecma-376/)
