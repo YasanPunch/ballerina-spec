@@ -90,7 +90,7 @@ string[][] raw     = check xlsx:parseSheet("orders.xlsx");    // raw text
 map<CellValue>[] m = check xlsx:parseSheet("orders.xlsx");    // natural cell values
 ```
 
-When the target does not pin a scalar type (a `map<CellValue>` value, a rest field, cell-level reads), each cell binds to its natural `CellValue`: whole number → `int`, fractional → `decimal`, boolean → `boolean`, string → `string`, date/time cell → ISO 8601 `string`, blank → `()`.
+When the target does not pin a scalar type (a `map<CellValue>` value, a rest field, cell-level reads), each cell binds to its natural `CellValue`: whole number → `int`, fractional → `decimal`, boolean → `boolean`, string → `string`, date/time cell → ISO 8601 `string`, blank → `()`. `float` is produced only target-driven — a natural read never yields it — and a blank cell binding to a non-nilable scalar target raises `TypeConversionError`.
 
 A `CellRange` record (four 0-based inclusive indices) describes rectangular regions for the used-range and table-geometry operations; A1-notation strings are accepted alongside it where natural.
 
@@ -151,7 +151,7 @@ Sheet writes share one contract, `SheetWriteMode` — the disposition toward con
 | `REPLACE` | Overwrite in place (`writeSheet` drops and recreates the sheet; row writers overwrite the target rows). |
 | `APPEND` | Add content without overwriting; content in the way shifts down. |
 
-`writeSheet` defaults to `FAIL_IF_EXISTS` (a one-shot export must not silently destroy a sheet), `Sheet.putRows` defaults to `APPEND` (bulk writes into an open workbook accumulate), and `Sheet.setRow` defaults to `REPLACE` (writing *row 5* means replacing row 5). Table writes use a separate `TableWriteMode` (`REPLACE` resizes-to-fit, `APPEND` inserts; a table always has a data region, so there is no `FAIL_IF_EXISTS`).
+`writeSheet` defaults to `FAIL_IF_EXISTS` (a one-shot export must not silently destroy a sheet), `Sheet.putRows` defaults to `APPEND` (bulk writes into an open workbook accumulate), and `Sheet.setRow` defaults to `REPLACE` (writing *row 5* means replacing row 5). Table writes use a separate `TableWriteMode` (`REPLACE` resizes-to-fit, `APPEND` inserts; a table always has a data region, so there is no `FAIL_IF_EXISTS`). Empty input is defined everywhere: an empty table `REPLACE` clears the table to a single blank data row, an empty table `APPEND` is a no-op, and an empty sheet write creates the target sheet and writes nothing.
 
 ### 6. Header mapping — `@xlsx:Name`
 
