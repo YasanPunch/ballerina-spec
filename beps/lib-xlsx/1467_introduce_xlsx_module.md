@@ -209,14 +209,19 @@ Multi-sheet coordination through the Workbook API:
 
 ```ballerina
 xlsx:Workbook wb = check xlsx:fromFile("sales.xlsx");
-xlsx:Sheet rawSheet = check wb.getSheet("Raw");
-Sale[] sales = check rawSheet.getRows();
+do {
+    xlsx:Sheet rawSheet = check wb.getSheet("Raw");
+    Sale[] sales = check rawSheet.getRows();
 
-Sale[] highValue = from Sale s in sales where s.price > 100d select s;
+    Sale[] highValue = from Sale s in sales where s.price > 100d select s;
 
-xlsx:Sheet summary = check wb.createSheet("HighValue");
-check summary.putRows(highValue);
-check wb.save();
+    xlsx:Sheet summary = check wb.createSheet("HighValue");
+    check summary.putRows(highValue);
+    check wb.save();
+} on fail error e {
+    check wb.close();
+    return e;
+}
 check wb.close();
 ```
 
@@ -225,10 +230,15 @@ Bytes in, bytes out — no disk touched:
 ```ballerina
 byte[] inputBytes = check sftp->get("/in/orders.xlsx");
 xlsx:Workbook wb = check xlsx:fromBytes(inputBytes);
-xlsx:Sheet sheet = check wb.getSheet(0);
-Order[] orders = check sheet.getRows();
-check sheet.putRows(from Order o in orders select {...o, amount: o.amount * 1.1d});
-check sftp->put("/out/orders-enriched.xlsx", check wb.toBytes());
+do {
+    xlsx:Sheet sheet = check wb.getSheet(0);
+    Order[] orders = check sheet.getRows();
+    check sheet.putRows(from Order o in orders select {...o, amount: o.amount * 1.1d});
+    check sftp->put("/out/orders-enriched.xlsx", check wb.toBytes());
+} on fail error e {
+    check wb.close();
+    return e;
+}
 check wb.close();
 ```
 
@@ -248,6 +258,7 @@ The module repository carries the test suite: a binding matrix across every `Cel
 ## Risks and Assumptions
 
 * **Memory.** The DOM model assumes workbooks fit in memory; the bytes path additionally sustains roughly 1.5–2.5× the DOM heap for the workbook's lifetime (the underlying parser inflates every zip entry up front). Both are documented, with a temp-file pattern recommended for large byte payloads. Files larger than memory are out of scope until a streaming tier exists.
+* **Untrusted input.** The parse path is protected by POI's `ZipSecureFile` defaults — a 1% minimum inflate ratio and per-entry size caps — which reject classic zip-bomb payloads. Overall workbook memory remains bounded only by the heap; configurable module-level limits with a typed error are future work.
 * **Large integers lose precision silently on write.** Excel stores numeric cells as IEEE-754 doubles, so integers with `|n| > 2^53` round silently — the same behaviour as POI, openpyxl, and Excel itself. The documented escape hatch is declaring the field as `string`, which round-trips digits exactly as a text cell.
 * **Dependency weight.** POI and its transitive dependencies (xmlbeans, commons-compress, and others) are a substantial native payload, affecting package size and requiring GraalVM reachability configuration. This is the accepted cost of complete OOXML support.
 * **Concurrency.** A workbook and its vended handles are not safe for concurrent mutation; this is a documented contract rather than an enforced one.
@@ -265,6 +276,9 @@ The module repository carries the test suite: a binding matrix across every `Cel
 * **Cell styling** (number formats, fonts, fills) and **named ranges**.
 * **Password-protected (encrypted) workbooks** and the legacy **XLS** format.
 * **Range operations** (rectangular multi-cell reads and writes).
+* **Configurable resource limits** for untrusted input (input size, row and cell caps) surfaced with a typed error, beyond POI's built-in ZIP protections.
+* **A distinct lifecycle error subtype** for methods invoked on invalidated (deleted or closed) `Workbook`, `Sheet`, and `Table` handles.
+* **A defined contract for formula cells with missing cached results** under `FormulaMode.CACHED`, with fixtures covering the never-evaluated case.
 
 ## References
 
